@@ -1,3 +1,6 @@
+//go:build !race
+// +build !race
+
 package cb_test
 
 import (
@@ -27,8 +30,8 @@ func TestBreaker_Closed(t *testing.T) {
 	for i := 0; i < 5; i++ {
 		_ = b.Execute(func() error {
 			c := http.Client{}
-			_, _ = c.Get("http://localhost:8080/test")
-			return nil
+			_, err := c.Get("http://localhost:8080/test")
+			return err
 		})
 	}
 
@@ -38,16 +41,36 @@ func TestBreaker_Closed(t *testing.T) {
 func TestBreaker_HalfOpen(t *testing.T) {
 	b := cb.NewBreaker(
 		cb.WaitingTime(2),
-		cb.Counter(1))
+		cb.Counter(2))
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < 5; i++ {
 		_ = b.Execute(func() error {
 			c := http.Client{}
-			_, _ = c.Get("http://localhost:8080/test")
-			return nil
+			_, err := c.Get("http://localhost:8080/test")
+			time.Sleep(1 * time.Second)
+			return err
 		})
 	}
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 	assert.Equal(t, cb.HalfOpen, b.Status)
 }
+
+/*
+func TestBreaker_HalfOpenToClosedState(t *testing.T) {
+	b := cb.NewBreaker(
+		cb.WaitingTime(1),
+		cb.Counter(1))
+
+	for i := 0; i < 10; i++ {
+		_ = b.Execute(func() error {
+			c := http.Client{}
+			_, err := c.Get("http://localhost:8080/test")
+			time.Sleep(1 * time.Second)
+			return err
+		})
+	}
+
+	time.Sleep(5 * time.Second)
+	assert.Equal(t, cb.Closed, b.Status)
+}*/

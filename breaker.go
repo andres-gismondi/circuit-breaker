@@ -17,6 +17,7 @@ type Breaker struct {
 	errPercentage float64
 	ctx           context.Context
 	mutex         sync.Mutex
+	wake          chan bool
 	half          *half
 
 	mutable *state
@@ -76,6 +77,9 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 	}
 
 	errP := int8(float64(cb.counter) * cb.errPercentage)
+	if errP == cb.counter {
+		errP = cb.counter - 1
+	}
 	cb.half.errCount = errP
 	cb.half.sucCount = cb.counter - errP
 	cb.half.counter = cb.counter
@@ -89,6 +93,7 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 	}
 
 	go cb.halfOpen()
+	go cb.wakeBreaker()
 	return cb
 }
 
@@ -157,17 +162,16 @@ func (cb *Breaker) halfOpen() {
 		case req := <-cb.half.reqChan:
 			// Let get in only middle counter requests
 			cb.mutable.halfCounter--
-			if cb.half.counter < 0 {
+			if cb.mutable.halfCounter < 0 {
 				cb.Status = Closed
 				cb.half.resChan <- ErrHalfOpen
 			} else {
 				cb.executeHalfOpen(req)
 			}
-			/*case <-time.After(2 * time.Second):
+		case <-cb.wake:
 			cb.doMutex(func() {
-				cb.Status = Open
-				*cb.counter = defaultCounter
-			})*/
+				cb.openState()
+			})
 		}
 	}
 }
@@ -183,19 +187,34 @@ func (cb *Breaker) executeHalfOpen(req func() error) {
 		cb.half.resChan <- err
 	} else {
 		cb.mutable.sucCounter--
-		if cb.mutable.sucCounter <= 0 {
+		if cb.mutable.sucCounter < 0 {
 			cb.doMutex(func() {
-				cb.Status = Open
-				cb.mutable = &state{
-					sleepBarrier: false,
-					counter:      cb.counter,
-					halfCounter:  cb.half.counter,
-					errCounter:   cb.half.errCount,
-					sucCounter:   cb.half.sucCount,
-				}
+				cb.openState()
 			})
 		}
 		cb.half.resChan <- err
+	}
+}
+
+func (cb *Breaker) wakeBreaker() {
+	for {
+		select {
+		case <-time.After(60 * time.Second): //TODO: change this default time
+			if cb.Status == Closed {
+				cb.wake <- true
+			}
+		}
+	}
+}
+
+func (cb *Breaker) openState() {
+	cb.Status = Open
+	cb.mutable = &state{
+		sleepBarrier: false,
+		counter:      cb.counter,
+		halfCounter:  cb.half.counter,
+		errCounter:   cb.half.errCount,
+		sucCounter:   cb.half.sucCount,
 	}
 }
 
