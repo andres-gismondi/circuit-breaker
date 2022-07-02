@@ -21,6 +21,18 @@ func Counter(count int8) BreakerOption {
 	}
 }
 
+func WindowTime(time time.Duration) BreakerOption {
+	return func(b *Breaker) {
+		b.window = time
+	}
+}
+
+func ErrorPercentage(p int8) BreakerOption {
+	return func(b *Breaker) {
+		b.errPercentage = float64(p / 100)
+	}
+}
+
 func WithContext(ctx context.Context) BreakerOption {
 	return func(b *Breaker) {
 		b.ctx = ctx

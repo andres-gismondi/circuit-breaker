@@ -9,14 +9,17 @@ import (
 )
 
 type Breaker struct {
-	timeout      time.Duration
-	counter      int8
-	status       Status
-	sleepBarrier bool
+	timeout time.Duration
+	counter int8
+	Status  Status
+	window  time.Duration
 
-	ctx   context.Context
-	mutex sync.Mutex
-	half  half
+	errPercentage float64
+	ctx           context.Context
+	mutex         sync.Mutex
+	half          *half
+
+	mutable *state
 }
 
 type half struct {
@@ -27,34 +30,44 @@ type half struct {
 	resChan  chan error
 }
 
+type state struct {
+	counter      int8
+	halfCounter  int8
+	errCounter   int8
+	sucCounter   int8
+	sleepBarrier bool
+}
+
 type Status int
 
 const (
 	Open Status = iota
 	HalfOpen
 	Closed
+)
 
-	defaultCounter int8 = 5
+var (
+	ErrExecuted = errors.New("service error")
+	ErrHalfOpen = errors.New("half open excluded")
+	ErrClosed   = errors.New("closed circuit breaker")
 )
 
 func NewBreaker(opts ...BreakerOption) *Breaker {
+
 	cb := &Breaker{
-		mutex:        sync.Mutex{},
-		sleepBarrier: false,
-		status:       Open,
-		half: half{
-			reqChan:  make(chan func() error),
-			resChan:  make(chan error),
-			sucCount: 6, // TODO: use a percentage in code, not in a variable
-			errCount: 5,
-			counter:  2,
+		mutex:  sync.Mutex{},
+		Status: Open,
+		half: &half{
+			reqChan: make(chan func() error),
+			resChan: make(chan error),
 		},
 	}
 
 	defaultOpt := []BreakerOption{
 		WaitingTime(5 * time.Second),
-		Counter(defaultCounter),
+		Counter(5),
 		WithContext(context.Background()),
+		ErrorPercentage(100),
 	}
 
 	options := append(defaultOpt, opts...)
@@ -62,18 +75,31 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 		o(cb)
 	}
 
+	errP := int8(float64(cb.counter) * cb.errPercentage)
+	cb.half.errCount = errP
+	cb.half.sucCount = cb.counter - errP
+	cb.half.counter = cb.counter
+
+	cb.mutable = &state{
+		sleepBarrier: false,
+		counter:      cb.counter,
+		halfCounter:  cb.half.counter,
+		errCounter:   cb.half.errCount,
+		sucCounter:   cb.half.sucCount,
+	}
+
 	go cb.halfOpen()
 	return cb
 }
 
 func (cb *Breaker) Execute(req func() error) error {
-	switch cb.status {
+	switch cb.Status {
 	case Open:
 		return cb.doOpen(req)
 	case HalfOpen:
 		return cb.doHalfOpen(req)
 	case Closed:
-		return errors.New("circuit breaker closed. Try later")
+		return ErrClosed
 	default:
 		return nil
 	}
@@ -83,14 +109,14 @@ func (cb *Breaker) doOpen(req func() error) error {
 	err := req()
 	if err != nil {
 		cb.doMutex(func() {
-			if cb.counter > 0 {
-				cb.counter--
+			if cb.mutable.counter > 0 {
+				cb.mutable.counter--
 				return
 			}
-			cb.status = Closed
+			cb.Status = Closed
 		})
 
-		if cb.status == Closed {
+		if cb.Status == Closed {
 			go cb.sleep()
 		}
 
@@ -102,17 +128,17 @@ func (cb *Breaker) doOpen(req func() error) error {
 func (cb *Breaker) sleep() {
 	// Circuit breaker sleep
 	cb.mutex.Lock()
-	if cb.sleepBarrier {
+	if cb.mutable.sleepBarrier {
 		cb.mutex.Unlock()
 		return
 	}
-	cb.sleepBarrier = true
+	cb.mutable.sleepBarrier = true
 	cb.mutex.Unlock()
 
 	<-time.After(cb.timeout)
 
 	cb.doMutex(func() {
-		cb.status = HalfOpen
+		cb.Status = HalfOpen
 	})
 }
 
@@ -130,13 +156,18 @@ func (cb *Breaker) halfOpen() {
 		select {
 		case req := <-cb.half.reqChan:
 			// Let get in only middle counter requests
-			cb.half.counter--
+			cb.mutable.halfCounter--
 			if cb.half.counter < 0 {
-				cb.status = Closed
-				cb.half.resChan <- errors.New("error")
+				cb.Status = Closed
+				cb.half.resChan <- ErrHalfOpen
 			} else {
 				cb.executeHalfOpen(req)
 			}
+			/*case <-time.After(2 * time.Second):
+			cb.doMutex(func() {
+				cb.Status = Open
+				*cb.counter = defaultCounter
+			})*/
 		}
 	}
 }
@@ -144,18 +175,24 @@ func (cb *Breaker) halfOpen() {
 func (cb *Breaker) executeHalfOpen(req func() error) {
 	err := req()
 	if err != nil {
-		cb.half.errCount--
-		if cb.half.errCount < 0 {
-			cb.sleepBarrier = false
+		cb.mutable.errCounter--
+		if cb.mutable.errCounter < 0 {
+			cb.mutable.sleepBarrier = false
 			go cb.sleep()
 		}
 		cb.half.resChan <- err
 	} else {
-		cb.half.sucCount--
-		if cb.half.sucCount < 0 {
+		cb.mutable.sucCounter--
+		if cb.mutable.sucCounter <= 0 {
 			cb.doMutex(func() {
-				cb.status = Open
-				cb.counter = defaultCounter
+				cb.Status = Open
+				cb.mutable = &state{
+					sleepBarrier: false,
+					counter:      cb.counter,
+					halfCounter:  cb.half.counter,
+					errCounter:   cb.half.errCount,
+					sucCounter:   cb.half.sucCount,
+				}
 			})
 		}
 		cb.half.resChan <- err
