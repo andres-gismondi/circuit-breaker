@@ -9,38 +9,45 @@ import (
 )
 
 type Breaker struct {
-	timeout time.Duration
-	counter int8
+	timeout      time.Duration
+	counter      int8
+	status       Status
+	sleepBarrier bool
 
 	ctx   context.Context
 	mutex sync.Mutex
-	enter bool
-	test  bool
-	midd  middleEnter
+	half  half
 }
 
-type middleEnter struct {
-	enter     bool
-	counter   int8
-	succCount int8
-	errCount  int8
-	testChan  chan func() error
-	resChan   chan error
+type half struct {
+	counter  int8
+	sucCount int8
+	errCount int8
+	reqChan  chan func() error
+	resChan  chan error
 }
 
-const defaultCounter int8 = 5
+type Status int
+
+const (
+	Open Status = iota
+	HalfOpen
+	Closed
+
+	defaultCounter int8 = 5
+)
 
 func NewBreaker(opts ...BreakerOption) *Breaker {
 	cb := &Breaker{
-		enter: true,
-		mutex: sync.Mutex{},
-		midd: middleEnter{
-			testChan:  make(chan func() error),
-			resChan:   make(chan error),
-			succCount: 6, // TODO: use a percentage in code, not in a variable
-			errCount:  5,
-			counter:   defaultCounter,
-			enter:     true,
+		mutex:        sync.Mutex{},
+		sleepBarrier: false,
+		status:       Open,
+		half: half{
+			reqChan:  make(chan func() error),
+			resChan:  make(chan error),
+			sucCount: 6, // TODO: use a percentage in code, not in a variable
+			errCount: 5,
+			counter:  2,
 		},
 	}
 
@@ -55,96 +62,116 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 		o(cb)
 	}
 
-	go cb.doTest()
+	go cb.halfOpen()
 	return cb
 }
 
 func (cb *Breaker) Execute(req func() error) error {
-	//fmt.Println(cb)
-	if !cb.enter {
-		return errors.New("circuit breaker activated. Try later")
-	}
-
-	if cb.test {
-
-		if !cb.midd.enter {
-			return errors.New("dotest circuit breaker activated. Try later")
-		}
-
-		cb.midd.testChan <- req
-		err := <-cb.midd.resChan
-		if err != nil {
-			return fmt.Errorf("dotest error executing request:%w", err)
-		}
+	switch cb.status {
+	case Open:
+		return cb.doOpen(req)
+	case HalfOpen:
+		return cb.doHalfOpen(req)
+	case Closed:
+		return errors.New("circuit breaker closed. Try later")
+	default:
 		return nil
 	}
+}
 
+func (cb *Breaker) doOpen(req func() error) error {
 	err := req()
 	if err != nil {
-		go cb.do()
-		return fmt.Errorf("do error executing request:%w", err)
+		cb.doMutex(func() {
+			if cb.counter > 0 {
+				cb.counter--
+				return
+			}
+			cb.status = Closed
+		})
+
+		if cb.status == Closed {
+			go cb.sleep()
+		}
+
+		return fmt.Errorf("open error executing request:%w", err)
 	}
 	return nil
 }
 
-func (cb *Breaker) do() {
+func (cb *Breaker) sleep() {
+	// Circuit breaker sleep
 	cb.mutex.Lock()
-	if cb.counter > 0 || !cb.enter {
-		cb.counter--
+	if cb.sleepBarrier {
 		cb.mutex.Unlock()
 		return
 	}
-
-	cb.enter = false
+	cb.sleepBarrier = true
 	cb.mutex.Unlock()
 
 	<-time.After(cb.timeout)
 
-	cb.mutex.Lock()
-	cb.test = true
-	cb.enter = true
-	cb.mutex.Unlock()
+	cb.doMutex(func() {
+		cb.status = HalfOpen
+	})
 }
 
-func (cb *Breaker) doTest() {
-	req := <-cb.midd.testChan
-
-	cb.midd.counter--
-	if cb.midd.counter < 0 {
-		cb.midd.enter = false
-		cb.midd.resChan <- errors.New("error")
-		return
+func (cb *Breaker) doHalfOpen(req func() error) error {
+	cb.half.reqChan <- req
+	err := <-cb.half.resChan
+	if err != nil {
+		return fmt.Errorf("error executing request half open:%w", err)
 	}
+	return nil
+}
 
+func (cb *Breaker) halfOpen() {
+	for {
+		select {
+		case req := <-cb.half.reqChan:
+			// Let get in only middle counter requests
+			cb.half.counter--
+			if cb.half.counter < 0 {
+				cb.status = Closed
+				cb.half.resChan <- errors.New("error")
+			} else {
+				cb.executeHalfOpen(req)
+			}
+		}
+	}
+}
+
+func (cb *Breaker) executeHalfOpen(req func() error) {
 	err := req()
 	if err != nil {
-		cb.midd.errCount--
-		if cb.midd.errCount < 0 {
-			cb.freeAccess(0)
+		cb.half.errCount--
+		if cb.half.errCount < 0 {
+			cb.sleepBarrier = false
+			go cb.sleep()
 		}
-		cb.midd.resChan <- err
-		return
+		cb.half.resChan <- err
+	} else {
+		cb.half.sucCount--
+		if cb.half.sucCount < 0 {
+			cb.doMutex(func() {
+				cb.status = Open
+				cb.counter = defaultCounter
+			})
+		}
+		cb.half.resChan <- err
 	}
-
-	cb.midd.succCount--
-	if cb.midd.succCount < 0 {
-		cb.freeAccess(defaultCounter)
-	}
-	cb.midd.resChan <- err
 }
 
-func (cb *Breaker) freeAccess(count int8) {
+func (cb *Breaker) doMutex(fn func()) {
 	cb.mutex.Lock()
-	cb.enter = true
-	cb.midd.enter = true
-	cb.test = true
-	cb.counter = count
-	cb.mutex.Unlock()
+	defer cb.mutex.Unlock()
+
+	fn()
 }
 
 func (cb *Breaker) print(from string) {
-	cb.mutex.Lock()
-	fmt.Printf("%v --> %v", from, cb)
-	fmt.Println()
-	cb.mutex.Unlock()
+	cb.doMutex(func() {
+		fmt.Printf("%v --> %v", from, cb)
+		fmt.Println()
+	})
 }

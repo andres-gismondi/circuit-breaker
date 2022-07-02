@@ -11,27 +11,27 @@ import (
 
 func TestBreaker_Execute(t *testing.T) {
 	breaker := cb.NewBreaker(
-		cb.WaitingTime(3*time.Second),
+		cb.WaitingTime(2*time.Second),
 		cb.Counter(4))
 	for i := 0; i < 5; i++ {
 		go testbreaker(breaker, t)
 	}
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 	for j := 0; j < 5; j++ {
 		go testbreaker(breaker, t)
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 	for i := 0; i < 5; i++ {
 		go testbreaker(breaker, t)
 	}
 
-	time.Sleep(1 * time.Second)
+	time.Sleep(2 * time.Second)
 	for i := 0; i < 5; i++ {
 		go testbreaker(breaker, t)
 	}
 
-	time.Sleep(5 * time.Second)
+	time.Sleep(10 * time.Second)
 }
 
 func testbreaker(breaker *cb.Breaker, t *testing.T) {
