@@ -18,9 +18,10 @@ type Breaker struct {
 	ctx           context.Context
 	mutex         sync.Mutex
 	wake          chan bool
-	half          *half
 
-	mutable *state
+	wt      windowTime
+	half    half
+	mutable state
 }
 
 type half struct {
@@ -37,6 +38,10 @@ type state struct {
 	errCounter   int8
 	sucCounter   int8
 	sleepBarrier bool
+}
+
+type windowTime struct {
+	first time.Time
 }
 
 type Status int
@@ -58,7 +63,8 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 	cb := &Breaker{
 		mutex:  sync.Mutex{},
 		Status: Open,
-		half: &half{
+		wt:     windowTime{},
+		half: half{
 			reqChan: make(chan func() error),
 			resChan: make(chan error),
 		},
@@ -69,6 +75,7 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 		Counter(5),
 		WithContext(context.Background()),
 		ErrorPercentage(100),
+		WindowTime(5 * time.Second),
 	}
 
 	options := append(defaultOpt, opts...)
@@ -84,7 +91,7 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 	cb.half.sucCount = cb.counter - errP
 	cb.half.counter = cb.counter
 
-	cb.mutable = &state{
+	cb.mutable = state{
 		sleepBarrier: false,
 		counter:      cb.counter,
 		halfCounter:  cb.half.counter,
@@ -93,7 +100,7 @@ func NewBreaker(opts ...BreakerOption) *Breaker {
 	}
 
 	go cb.halfOpen()
-	go cb.wakeBreaker()
+	go cb.wakeUpBreaker()
 	return cb
 }
 
@@ -116,9 +123,21 @@ func (cb *Breaker) doOpen(req func() error) error {
 		cb.doMutex(func() {
 			if cb.mutable.counter > 0 {
 				cb.mutable.counter--
+
+				// first error
+				if cb.mutable.counter+1 == cb.counter {
+					cb.wt.first = time.Now()
+				}
 				return
 			}
-			cb.Status = Closed
+
+			// verify if duration between first error and last one is inside window
+			w := time.Now().Sub(cb.wt.first)
+			if w <= cb.window {
+				cb.Status = Closed
+			} else {
+				cb.openState()
+			}
 		})
 
 		if cb.Status == Closed {
@@ -196,7 +215,7 @@ func (cb *Breaker) executeHalfOpen(req func() error) {
 	}
 }
 
-func (cb *Breaker) wakeBreaker() {
+func (cb *Breaker) wakeUpBreaker() {
 	for {
 		select {
 		case <-time.After(60 * time.Second): //TODO: change this default time
@@ -209,7 +228,8 @@ func (cb *Breaker) wakeBreaker() {
 
 func (cb *Breaker) openState() {
 	cb.Status = Open
-	cb.mutable = &state{
+	cb.wt = windowTime{}
+	cb.mutable = state{
 		sleepBarrier: false,
 		counter:      cb.counter,
 		halfCounter:  cb.half.counter,
