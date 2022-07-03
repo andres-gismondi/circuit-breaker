@@ -21,6 +21,12 @@ func Counter(count int8) BreakerOption {
 	}
 }
 
+func WakeUpBreaker(t time.Duration) BreakerOption {
+	return func(b *Breaker) {
+		b.wake = t
+	}
+}
+
 func WindowTime(time time.Duration) BreakerOption {
 	return func(b *Breaker) {
 		b.window = time
